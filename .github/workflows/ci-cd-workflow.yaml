@@ -1,0 +1,215 @@
+
+name: CI/CD Pipeline
+
+
+
+on:
+
+  push:
+
+    branches: [ main, master ]
+
+  pull_request:
+
+    branches: [ main, master ]
+
+
+
+jobs:
+
+  test:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+    - name: Checkout code
+
+      uses: actions/checkout@v3
+
+    
+
+    # Frontend tests
+
+    - name: Set up Node.js for frontend
+
+      uses: actions/setup-node@v3
+
+      with:
+
+        node-version: '18'
+
+        
+
+    - name: Install frontend dependencies
+
+      run: cd frontend && npm install
+
+    
+
+    - name: Run frontend tests
+
+      run: cd frontend && npm test
+
+    
+
+    # Backend tests
+
+    - name: Set up JDK for backend
+
+      uses: actions/setup-java@v3
+
+      with:
+
+        distribution: 'temurin'
+
+        java-version: '17'
+
+        
+
+    - name: Run backend tests
+
+      run: cd backend && ./mvnw test
+
+
+
+  build:
+
+    needs: test
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+    - name: Checkout code
+
+      uses: actions/checkout@v3
+
+    
+
+    - name: Set up Docker Buildx
+
+      uses: docker/setup-buildx-action@v2
+
+    
+
+    - name: Login to DockerHub
+
+      uses: docker/login-action@v2
+
+      with:
+
+        username: ${{ secrets.DOCKER_USERNAME }}
+
+        password: ${{ secrets.DOCKER_PASSWORD }}
+
+    
+
+    - name: Build and push frontend image
+
+      uses: docker/build-push-action@v4
+
+      with:
+
+        context: ./frontend
+
+        push: ${{ github.event_name != 'pull_request' }}
+
+        tags: docasg-frontend:${{ github.sha }},docasg-frontend:latest
+
+    
+
+    - name: Build and push backend image
+
+      uses: docker/build-push-action@v4
+
+      with:
+
+        context: ./backend
+
+        push: ${{ github.event_name != 'pull_request' }}
+
+        tags: docasg-backend:${{ github.sha }},docasg-backend:latest
+
+
+
+  deploy:
+
+    needs: build
+
+    runs-on: ubuntu-latest
+
+    if: github.event_name != 'pull_request'
+
+    
+
+    steps:
+
+    - name: Checkout code
+
+      uses: actions/checkout@v3
+
+    
+
+    - name: Set up Minikube
+
+      uses: medyagh/setup-minikube@master
+
+    
+
+    - name: Update deployment manifests
+
+      run: |
+
+        # Update the image tags in deployment files
+
+        sed -i "s|image:.*docasg-frontend.*|image: docasg-frontend:${{ github.sha }}|g" kubernetes/frontend-deployment.yaml
+
+        sed -i "s|image:.*docasg-backend.*|image: docasg-backend:${{ github.sha }}|g" kubernetes/backend-deployment.yaml
+
+    
+
+    - name: Update imagePullPolicy to Never
+
+      run: |
+
+        # Set imagePullPolicy to Never to use local images
+
+        sed -i 's/imagePullPolicy:.*/imagePullPolicy: Never/g' kubernetes/frontend-deployment.yaml
+
+        sed -i 's/imagePullPolicy:.*/imagePullPolicy: Never/g' kubernetes/backend-deployment.yaml
+
+    
+
+    - name: Build and load images to Minikube
+
+      run: |
+
+        # Build images directly in Minikube's Docker environment
+
+        eval $(minikube docker-env)
+
+        docker build -t docasg-frontend:${{ github.sha }} ./frontend
+
+        docker build -t docasg-backend:${{ github.sha }} ./backend
+
+    
+
+    - name: Apply Kubernetes manifests
+
+      run: |
+
+        kubectl apply -f kubernetes/
+
+    
+
+    - name: Verify deployment
+
+      run: |
+
+        kubectl get pods -A
+
+        kubectl get services
+
+        minikube service list
+

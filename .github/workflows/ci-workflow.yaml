@@ -1,0 +1,110 @@
+
+name: Continuous Integration
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    # Frontend tests with caching and error handling
+    - name: Set up Node.js for frontend
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: 'frontend/package-lock.json'
+        
+    - name: Install frontend dependencies
+      run: |
+        cd frontend
+        npm ci || (echo "::error::Failed to install frontend dependencies" && exit 1)
+      
+    - name: Run frontend tests
+      id: frontend-tests
+      run: |
+        cd frontend 
+        npm test || (echo "::error::Frontend tests failed" && exit 1)
+      continue-on-error: false
+    
+    # Backend tests with caching and error handling
+    - name: Set up JDK for backend
+      uses: actions/setup-java@v3
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+        cache: 'maven'
+        
+    - name: Run backend tests
+      id: backend-tests
+      run: |
+        cd backend
+        chmod +x ./mvnw
+        ./mvnw test || (echo "::error::Backend tests failed" && exit 1)
+      continue-on-error: false
+    
+    # Build and push Docker images
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+    
+    # Only login to DockerHub when pushing (not on PR)
+    - name: Login to DockerHub
+      if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+      uses: docker/login-action@v2
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+    
+    # Build frontend image (always)
+    - name: Build frontend image
+      uses: docker/build-push-action@v4
+      id: build-frontend
+      with:
+        context: ./frontend
+        push: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
+        tags: docasg-frontend:${{ github.sha }},docasg-frontend:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        outputs: type=docker,dest=/tmp/frontend-image.tar
+        
+    # Check frontend build status
+    - name: Verify frontend image build
+      if: steps.build-frontend.outcome == 'success'
+      run: echo "Frontend image successfully built"
+    
+    # Build backend image (always)
+    - name: Build backend image
+      uses: docker/build-push-action@v4
+      id: build-backend
+      with:
+        context: ./backend
+        push: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
+        tags: docasg-backend:${{ github.sha }},docasg-backend:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        outputs: type=docker,dest=/tmp/backend-image.tar
+        
+    # Check backend build status
+    - name: Verify backend image build
+      if: steps.build-backend.outcome == 'success'
+      run: echo "Backend image successfully built"
+      
+    # Save images for artifact storage if not pushing
+    - name: Save Docker images as artifacts
+      if: github.event_name == 'pull_request'
+      uses: actions/upload-artifact@v3
+      with:
+        name: docker-images
+        path: |
+          /tmp/frontend-image.tar
+          /tmp/backend-image.tar
+        retention-days: 1
+

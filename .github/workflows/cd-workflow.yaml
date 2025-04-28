@@ -1,0 +1,216 @@
+
+name: Continuous Deployment
+
+on:
+  workflow_run:
+    workflows: ["Continuous Integration"]
+    types:
+      - completed
+    branches: [ main, master ]
+
+env:
+  TIMEOUT_SECONDS: 300  # 5 minutes timeout for deployments
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      
+    - name: Store current deployment state for rollback
+      id: store-state
+      run: |
+        mkdir -p /tmp/k8s-backup
+        # We'll create this file only if we need to rollback
+        echo "DEPLOYMENT_TIMESTAMP=$(date +%s)" >> $GITHUB_ENV
+        echo "BACKUP_DIR=/tmp/k8s-backup" >> $GITHUB_ENV
+    
+    - name: Set up Minikube
+      uses: medyagh/setup-minikube@master
+      id: minikube
+      continue-on-error: false
+    
+    - name: Get Minikube status
+      run: |
+        minikube status || (echo "::error::Minikube failed to start" && exit 1)
+        echo "Minikube is running on: $(minikube ip)"
+        
+    - name: Check if Kubernetes cluster is healthy
+      run: |
+        kubectl cluster-info
+        kubectl get nodes
+        kubectl wait --for=condition=Ready node/$(kubectl get nodes -o name | head -n 1 | cut -d'/' -f2) --timeout=2m
+    
+    - name: Backup current deployment state
+      run: |
+        mkdir -p $BACKUP_DIR
+        if kubectl get deployments -o name 2>/dev/null | grep -q "deployment.apps/frontend"; then
+          kubectl get deployment frontend -o yaml > $BACKUP_DIR/frontend-deployment.yaml
+        fi
+        if kubectl get deployments -o name 2>/dev/null | grep -q "deployment.apps/backend"; then
+          kubectl get deployment backend -o yaml > $BACKUP_DIR/backend-deployment.yaml
+        fi
+        if kubectl get services -o name 2>/dev/null | grep -q "service/frontend"; then
+          kubectl get service frontend -o yaml > $BACKUP_DIR/frontend-service.yaml
+        fi
+        if kubectl get services -o name 2>/dev/null | grep -q "service/backend"; then
+          kubectl get service backend -o yaml > $BACKUP_DIR/backend-service.yaml
+        fi
+    
+    - name: Update deployment manifests
+      run: |
+        # Update the image tags in deployment files
+        sed -i "s|image:.*docasg-frontend.*|image: docasg-frontend:${{ github.sha }}|g" kubernetes/frontend-deployment.yaml
+        sed -i "s|image:.*docasg-backend.*|image: docasg-backend:${{ github.sha }}|g" kubernetes/backend-deployment.yaml
+        echo "Updated manifests with image tags for commit ${{ github.sha }}"
+    
+    - name: Update imagePullPolicy to Never
+      run: |
+        # Set imagePullPolicy to Never to use local images
+        sed -i 's/imagePullPolicy:.*/imagePullPolicy: Never/g' kubernetes/frontend-deployment.yaml
+        sed -i 's/imagePullPolicy:.*/imagePullPolicy: Never/g' kubernetes/backend-deployment.yaml
+        echo "Updated imagePullPolicy to Never for local images"
+    
+    - name: Build and load images to Minikube
+      id: build-images
+      run: |
+        # Build images directly in Minikube's Docker environment
+        eval $(minikube docker-env)
+        echo "Building frontend image..."
+        docker build -t docasg-frontend:${{ github.sha }} ./frontend || (echo "::error::Failed to build frontend image" && exit 1)
+        echo "Building backend image..."
+        docker build -t docasg-backend:${{ github.sha }} ./backend || (echo "::error::Failed to build backend image" && exit 1)
+        echo "Docker images built successfully in Minikube environment"
+        docker images | grep docasg
+    
+    - name: Apply Database Kubernetes manifests
+      id: apply-db
+      run: |
+        echo "Applying database deployment..."
+        kubectl apply -f kubernetes/db-deployment.yaml || (echo "::error::Failed to apply database deployment" && exit 1)
+        kubectl apply -f kubernetes/db-service.yaml || (echo "::error::Failed to apply database service" && exit 1)
+        
+        # Wait for database to be ready
+        echo "Waiting for database to be ready..."
+        kubectl wait --for=condition=ready pod -l app=db --timeout=120s || (echo "::error::Database failed to become ready" && exit 1)
+        echo "Database is ready"
+    
+    - name: Apply Backend and Frontend Kubernetes manifests
+      id: apply-services
+      run: |
+        echo "Applying backend deployment..."
+        kubectl apply -f kubernetes/backend-deployment.yaml || (echo "::error::Failed to apply backend deployment" && exit 1)
+        kubectl apply -f kubernetes/backend-service.yaml || (echo "::error::Failed to apply backend service" && exit 1)
+        
+        echo "Applying frontend deployment..."
+        kubectl apply -f kubernetes/frontend-deployment.yaml || (echo "::error::Failed to apply frontend deployment" && exit 1)
+        kubectl apply -f kubernetes/frontend-service.yaml || (echo "::error::Failed to apply frontend service" && exit 1)
+    
+    - name: Wait for deployments to be ready
+      id: wait-deployments
+      run: |
+        echo "Waiting for backend deployment to be ready..."
+        kubectl wait --for=condition=available --timeout=${TIMEOUT_SECONDS}s deployment/backend || (echo "::error::Backend deployment failed to become ready" && exit 1)
+        
+        echo "Waiting for frontend deployment to be ready..."
+        kubectl wait --for=condition=available --timeout=${TIMEOUT_SECONDS}s deployment/frontend || (echo "::error::Frontend deployment failed to become ready" && exit 1)
+        
+        echo "All deployments are ready"
+    
+    - name: Verify deployment status
+      id: verify-deployment
+      run: |
+        echo "Verifying pod status..."
+        kubectl get pods -A
+        
+        # Check if any pods are in a failed state
+        if kubectl get pods | grep -E 'CrashLoopBackOff|Error|Failed|Pending'; then
+          echo "::error::Some pods are in a failed state"
+          kubectl describe pods | grep -A 10 -B 10 -E 'Error|CrashLoopBackOff'
+          exit 1
+        fi
+        
+        echo "Verifying services..."
+        kubectl get services
+        minikube service list
+        
+        # Check backend health
+        echo "Checking backend health..."
+        BACKEND_URL=$(minikube service backend --url)
+        if [ -z "$BACKEND_URL" ]; then
+          echo "::error::Failed to get backend URL"
+          exit 1
+        fi
+        
+        # Wait for backend to respond
+        echo "Waiting for backend to respond..."
+        timeout 60 bash -c "until curl -s $BACKEND_URL/actuator/health; do sleep 2; done" || (echo "::error::Backend health check failed" && exit 1)
+        
+        # Check frontend health
+        echo "Checking frontend health..."
+        FRONTEND_URL=$(minikube service frontend --url)
+        if [ -z "$FRONTEND_URL" ]; then
+          echo "::error::Failed to get frontend URL"
+          exit 1
+        fi
+        
+        # Wait for frontend to respond
+        echo "Waiting for frontend to respond..."
+        timeout 60 bash -c "until curl -s $FRONTEND_URL; do sleep 2; done" || (echo "::error::Frontend health check failed" && exit 1)
+        
+        echo "All services are healthy and responding"
+    
+    - name: Verify database connectivity from backend
+      id: verify-db
+      run: |
+        echo "Verifying database connectivity from backend..."
+        BACKEND_POD=$(kubectl get pod -l app=backend -o jsonpath="{.items[0].metadata.name}")
+        
+        # Check if backend pod can connect to database
+        if ! kubectl exec $BACKEND_POD -- curl -s http://localhost:8080/actuator/health | grep -q "db.*UP"; then
+          echo "::error::Database connectivity check failed"
+          kubectl logs $BACKEND_POD
+          exit 1
+        fi
+        
+        echo "Database connectivity verified successfully"
+        
+    - name: Deployment successful
+      run: |
+        echo "Deployment completed successfully!"
+        echo "Frontend URL: $(minikube service frontend --url)"
+        echo "Backend URL: $(minikube service backend --url)"
+        
+    - name: Rollback on failure
+      if: failure()
+      run: |
+        echo "Deployment failed, initiating rollback..."
+        
+        # Apply backup files if they exist
+        if [ -f "$BACKUP_DIR/frontend-deployment.yaml" ]; then
+          echo "Rolling back frontend deployment..."
+          kubectl apply -f $BACKUP_DIR/frontend-deployment.yaml || true
+        fi
+        
+        if [ -f "$BACKUP_DIR/backend-deployment.yaml" ]; then
+          echo "Rolling back backend deployment..."
+          kubectl apply -f $BACKUP_DIR/backend-deployment.yaml || true
+        fi
+        
+        if [ -f "$BACKUP_DIR/frontend-service.yaml" ]; then
+          echo "Rolling back frontend service..."
+          kubectl apply -f $BACKUP_DIR/frontend-service.yaml || true
+        fi
+        
+        if [ -f "$BACKUP_DIR/backend-service.yaml" ]; then
+          echo "Rolling back backend service..."
+          kubectl apply -f $BACKUP_DIR/backend-service.yaml || true
+        fi
+        
+        echo "Rollback completed. Verifying status..."
+        kubectl get pods -A
+        kubectl get services
+        exit 1
